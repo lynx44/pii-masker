@@ -1,0 +1,38 @@
+{
+  "tables": [
+    {
+      "name": "Applicants",
+      "schema": "dbo",
+      "columns": [
+        {
+          "name": "FirstName",
+          "action": "shuffle"
+        },
+        {
+          "name": "LastName",
+          "action": "shuffle"
+        },
+        {
+          "name": "Email",
+          "action": "replace",
+          "value": "CONCAT('user_', CAST(ApplicantId AS VARCHAR), '@dev.invalid')"
+        },
+        {
+          "name": "Phone",
+          "action": "replace",
+          "value": "'555-000-0000'"
+        },
+        {
+          "name": "StreetAddress",
+          "action": "replace",
+          "value": "NULL"
+        },
+        {
+          "name": "DateOfBirth",
+          "action": "calculate",
+          "expression": "DATEADD(day, (ABS(CHECKSUM(NEWID())) % 365) - 182, DateOfBirth)"
+        }
+      ]
+    }
+  ]
+}
