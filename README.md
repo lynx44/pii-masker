@@ -24,6 +24,55 @@ pii-masker --scan --connection "Server=.;Database=MyDb;Trusted_Connection=True;T
 
 This connects to the database, inspects `INFORMATION_SCHEMA.COLUMNS`, and produces a suggested config. Columns it's uncertain about are marked with `"review": true` and a `"reason"` explaining the match.
 
+### Scan with extra patterns
+
+Use `--patterns` to supply additional column name patterns alongside the built-in ones. Useful when you know a specific database has non-standard column names that contain PII:
+
+```bash
+pii-masker --scan --connection "..." --patterns my-patterns.json --output suggested-config.json
+```
+
+#### Patterns file format
+
+```json
+{
+  "exact": [
+    {
+      "column": "NationalInsuranceNumber",
+      "action": "replace",
+      "value": "NULL"
+    },
+    {
+      "column": "PreferredName",
+      "action": "shuffle"
+    },
+    {
+      "column": "AnnualSalary",
+      "action": "calculate",
+      "expression": "ROUND([AnnualSalary] / 5000.0, 0) * 5000"
+    }
+  ],
+  "fuzzy": [
+    {
+      "pattern": "passport",
+      "action": "replace",
+      "value": "NULL"
+    },
+    {
+      "pattern": "nin",
+      "action": "replace",
+      "value": "NULL"
+    }
+  ]
+}
+```
+
+**`exact`** — matches a column by its full name (case-insensitive). If the same name exists in the built-in list, your entry takes precedence.
+
+**`fuzzy`** — matches any column whose name *contains* the pattern as a substring (case-insensitive). User-defined fuzzy patterns are checked before the built-in ones, so they can take precedence. Matched columns are always flagged with `"review": true` in the output.
+
+Both entry types follow the same `action` / `value` / `expression` rules as the masking config.
+
 ## Config file format
 
 ```json
@@ -160,10 +209,13 @@ pii-masker/
   Models/
     Config.cs              # Strongly-typed config models
     ColumnAction.cs        # Enum: Shuffle, Replace, Calculate
+    PatternsFile.cs        # Extra patterns file model
   Services/
     ConfigLoader.cs        # JSON deserialization + validation
+    PatternsLoader.cs      # Extra patterns deserialization + validation
     Scanner.cs             # DB scanning + PII heuristics
     ScriptGenerator.cs     # T-SQL generation logic
-  sample-config.json       # Example config file
+  sample-config.json       # Example masking config
+  sample-patterns.json     # Example extra patterns file for --scan
   README.md
 ```

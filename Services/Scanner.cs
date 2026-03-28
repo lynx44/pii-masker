@@ -57,25 +57,44 @@ public static class Scanner
         ["birth_date"]    = (ColumnAction.Calculate, null, null, "dob"),
     };
 
+    // Internal unified fuzzy pattern record
+    private readonly record struct FuzzyMatch(string Pattern, ColumnAction Action, string? Value, string? Expression);
+
     // Fuzzy patterns: if a column name contains any of these substrings, flag for review
-    private static readonly (string pattern, string category)[] FuzzyPatterns =
+    private static readonly FuzzyMatch[] BuiltInFuzzyPatterns =
     {
-        ("name", "name"),
-        ("email", "email"),
-        ("phone", "phone"),
-        ("mobile", "phone"),
-        ("addr", "address"),
-        ("street", "address"),
-        ("ssn", "government_id"),
-        ("birth", "dob"),
-        ("salary", "financial"),
-        ("wage", "financial"),
-        ("bank", "financial"),
-        ("account", "financial"),
+        new("name",    ColumnAction.Shuffle,  null,            null),
+        new("email",   ColumnAction.Replace,  null,            null),   // value resolved at runtime using PK
+        new("phone",   ColumnAction.Replace,  "'555-000-0000'", null),
+        new("mobile",  ColumnAction.Replace,  "'555-000-0000'", null),
+        new("addr",    ColumnAction.Replace,  "NULL",          null),
+        new("street",  ColumnAction.Replace,  "NULL",          null),
+        new("ssn",     ColumnAction.Replace,  "NULL",          null),
+        new("birth",   ColumnAction.Calculate, null,           null),   // expression resolved at runtime
+        new("salary",  ColumnAction.Replace,  "NULL",          null),
+        new("wage",    ColumnAction.Replace,  "NULL",          null),
+        new("bank",    ColumnAction.Replace,  "NULL",          null),
+        new("account", ColumnAction.Replace,  "NULL",          null),
     };
 
-    public static async Task<MaskingConfig> ScanAsync(string connectionString)
+    public static async Task<MaskingConfig> ScanAsync(string connectionString, PatternsFile? extraPatterns = null)
     {
+        // Merge extra exact patterns — user-supplied entries override built-ins on name collision
+        var effectiveExact = new Dictionary<string, (ColumnAction action, string? value, string? expression, string category)>(ExactMatches, StringComparer.OrdinalIgnoreCase);
+        if (extraPatterns?.Exact.Count > 0)
+        {
+            foreach (var p in extraPatterns.Exact)
+                effectiveExact[p.Column] = (p.Action, p.Value, p.Expression, "custom");
+        }
+
+        // Extra fuzzy patterns are checked before built-ins so they can take precedence
+        FuzzyMatch[] effectiveFuzzy = extraPatterns?.Fuzzy.Count > 0
+            ? extraPatterns.Fuzzy
+                .Select(p => new FuzzyMatch(p.Pattern, p.Action, p.Value, p.Expression))
+                .Concat(BuiltInFuzzyPatterns)
+                .ToArray()
+            : BuiltInFuzzyPatterns;
+
         var config = new MaskingConfig();
 
         await using var connection = new SqlConnection(connectionString);
@@ -120,7 +139,7 @@ public static class Scanner
                 string colName = colReader.GetString(0);
                 string dataType = colReader.GetString(1);
 
-                var colConfig = ClassifyColumn(colName, dataType, pkColumn);
+                var colConfig = ClassifyColumn(colName, dataType, pkColumn, effectiveExact, effectiveFuzzy);
                 if (colConfig != null)
                 {
                     tableConfig.Columns.Add(colConfig);
@@ -136,10 +155,15 @@ public static class Scanner
         return config;
     }
 
-    private static ColumnConfig? ClassifyColumn(string colName, string dataType, string pkColumn)
+    private static ColumnConfig? ClassifyColumn(
+        string colName,
+        string dataType,
+        string pkColumn,
+        Dictionary<string, (ColumnAction action, string? value, string? expression, string category)> exactMatches,
+        FuzzyMatch[] fuzzyPatterns)
     {
         // Check exact matches first
-        if (ExactMatches.TryGetValue(colName, out var match))
+        if (exactMatches.TryGetValue(colName, out var match))
         {
             var col = new ColumnConfig
             {
@@ -147,6 +171,7 @@ public static class Scanner
                 Action = match.action
             };
 
+            // Built-in special categories resolve value/expression dynamically using the PK column
             switch (match.category)
             {
                 case "email":
@@ -166,55 +191,46 @@ public static class Scanner
 
         // Check fuzzy patterns — flag for review
         string normalizedName = colName.ToLowerInvariant();
-        foreach (var (pattern, category) in FuzzyPatterns)
+        foreach (var fuzzy in fuzzyPatterns)
         {
-            if (normalizedName.Contains(pattern, StringComparison.OrdinalIgnoreCase))
+            if (!normalizedName.Contains(fuzzy.Pattern, StringComparison.OrdinalIgnoreCase))
+                continue;
+
+            // Skip likely foreign key / ID columns
+            if (normalizedName.EndsWith("id") || normalizedName.EndsWith("_id"))
+                return null;
+
+            var col = new ColumnConfig
             {
-                // Skip if it's likely a foreign key or ID column
-                if (normalizedName.EndsWith("id") || normalizedName.EndsWith("_id"))
-                    return null;
+                Name = colName,
+                Action = fuzzy.Action,
+                Review = true,
+                Reason = $"Column name contains '{fuzzy.Pattern}' — may contain PII"
+            };
 
-                var col = new ColumnConfig
+            // If fuzzy.Value/Expression are null this is a built-in pattern; resolve dynamically
+            if (fuzzy.Value is null && fuzzy.Expression is null)
+            {
+                switch (fuzzy.Pattern)
                 {
-                    Name = colName,
-                    Review = true,
-                    Reason = $"Column name contains '{pattern}' — may contain {category} PII"
-                };
-
-                // Best-guess action based on category
-                switch (category)
-                {
-                    case "name":
-                        col.Action = ColumnAction.Shuffle;
-                        break;
                     case "email":
-                        col.Action = ColumnAction.Replace;
                         col.Value = $"CONCAT('user_', CAST([{pkColumn}] AS VARCHAR), '@dev.invalid')";
                         break;
-                    case "phone":
-                        col.Action = ColumnAction.Replace;
-                        col.Value = "'555-000-0000'";
-                        break;
-                    case "address":
-                        col.Action = ColumnAction.Replace;
-                        col.Value = "NULL";
-                        break;
-                    case "government_id":
-                        col.Action = ColumnAction.Replace;
-                        col.Value = "NULL";
-                        break;
-                    case "dob":
-                        col.Action = ColumnAction.Calculate;
+                    case "birth":
                         col.Expression = $"DATEADD(day, (ABS(CHECKSUM(NEWID())) % 365) - 182, [{colName}])";
                         break;
-                    case "financial":
-                        col.Action = ColumnAction.Replace;
-                        col.Value = "NULL";
+                    default:
+                        // Shuffle needs no value/expression
                         break;
                 }
-
-                return col;
             }
+            else
+            {
+                col.Value = fuzzy.Value;
+                col.Expression = fuzzy.Expression;
+            }
+
+            return col;
         }
 
         return null;

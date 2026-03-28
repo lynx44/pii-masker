@@ -1,4 +1,5 @@
 using System.CommandLine;
+using PiiMasker.Models;
 using PiiMasker.Services;
 
 var configOption = new Option<FileInfo?>(
@@ -17,21 +18,26 @@ var scanOption = new Option<bool>(
     name: "--scan",
     description: "Scan the database to suggest a PII masking config");
 
+var patternsOption = new Option<FileInfo?>(
+    name: "--patterns",
+    description: "Path to a JSON file with additional exact/fuzzy column name patterns for --scan mode");
+
 var rootCommand = new RootCommand("pii-masker — Generate T-SQL masking scripts from a config file")
 {
     configOption,
     connectionOption,
     outputOption,
-    scanOption
+    scanOption,
+    patternsOption
 };
 
-rootCommand.SetHandler(async (FileInfo? config, string? connection, FileInfo? output, bool scan) =>
+rootCommand.SetHandler(async (FileInfo? config, string? connection, FileInfo? output, bool scan, FileInfo? patterns) =>
 {
     try
     {
         if (scan)
         {
-            await HandleScan(connection, output);
+            await HandleScan(connection, output, patterns);
         }
         else
         {
@@ -43,7 +49,7 @@ rootCommand.SetHandler(async (FileInfo? config, string? connection, FileInfo? ou
         Console.Error.WriteLine($"Error: {ex.Message}");
         Environment.ExitCode = 1;
     }
-}, configOption, connectionOption, outputOption, scanOption);
+}, configOption, connectionOption, outputOption, scanOption, patternsOption);
 
 return await rootCommand.InvokeAsync(args);
 
@@ -87,7 +93,7 @@ static void HandleGenerate(FileInfo? configFile, string? connection, FileInfo? o
     Console.WriteLine($"  Output written to: {outputFile.FullName}");
 }
 
-static async Task HandleScan(string? connection, FileInfo? outputFile)
+static async Task HandleScan(string? connection, FileInfo? outputFile, FileInfo? patternsFile)
 {
     if (string.IsNullOrEmpty(connection))
     {
@@ -96,8 +102,16 @@ static async Task HandleScan(string? connection, FileInfo? outputFile)
         return;
     }
 
+    PiiMasker.Models.PatternsFile? extraPatterns = null;
+    if (patternsFile is not null)
+    {
+        Console.WriteLine($"Loading extra patterns from: {patternsFile.FullName}");
+        extraPatterns = PatternsLoader.Load(patternsFile.FullName);
+        Console.WriteLine($"  {extraPatterns.Exact.Count} exact pattern(s), {extraPatterns.Fuzzy.Count} fuzzy pattern(s) loaded.");
+    }
+
     Console.WriteLine("Connecting to database and scanning for PII columns...");
-    var config = await Scanner.ScanAsync(connection);
+    var config = await Scanner.ScanAsync(connection, extraPatterns);
 
     string json = Scanner.SerializeConfig(config);
 
