@@ -21,6 +21,10 @@ public static class ScriptGenerator
         sb.AppendLine();
         sb.AppendLine("BEGIN TRANSACTION;");
         sb.AppendLine();
+        // PRINT does not accept subqueries in its expression, so the row counts
+        // below are read into this variable first.
+        sb.AppendLine("DECLARE @rc INT;");
+        sb.AppendLine();
 
         foreach (var table in config.Tables)
         {
@@ -31,7 +35,8 @@ public static class ScriptGenerator
             sb.AppendLine("-- " + new string('=', 70));
             sb.AppendLine();
             sb.AppendLine($"PRINT 'Processing {fullName}...';");
-            sb.AppendLine($"PRINT 'Row count before: ' + CAST((SELECT COUNT(*) FROM {fullName}) AS VARCHAR);");
+            sb.AppendLine($"SET @rc = (SELECT COUNT(*) FROM {fullName});");
+            sb.AppendLine("PRINT 'Row count before: ' + CAST(@rc AS VARCHAR);");
             sb.AppendLine();
 
             // Group columns by action type for efficient generation
@@ -60,7 +65,8 @@ public static class ScriptGenerator
                 totalColumns += calculateColumns.Count;
             }
 
-            sb.AppendLine($"PRINT 'Row count after: ' + CAST((SELECT COUNT(*) FROM {fullName}) AS VARCHAR);");
+            sb.AppendLine($"SET @rc = (SELECT COUNT(*) FROM {fullName});");
+            sb.AppendLine("PRINT 'Row count after: ' + CAST(@rc AS VARCHAR);");
             sb.AppendLine($"PRINT '{fullName} complete.';");
             sb.AppendLine($"PRINT '';");
             sb.AppendLine();

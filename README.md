@@ -175,12 +175,15 @@ SET XACT_ABORT ON;
 
 BEGIN TRANSACTION;
 
+DECLARE @rc INT;
+
 -- ======================================================================
 -- Table: [dbo].[Applicants]
 -- ======================================================================
 
 PRINT 'Processing [dbo].[Applicants]...';
-PRINT 'Row count before: ' + CAST((SELECT COUNT(*) FROM [dbo].[Applicants]) AS VARCHAR);
+SET @rc = (SELECT COUNT(*) FROM [dbo].[Applicants]);
+PRINT 'Row count before: ' + CAST(@rc AS VARCHAR);
 
 -- Shuffle: FirstName
 WITH Shuffled AS (
@@ -215,7 +218,8 @@ SET
   [DateOfBirth] = DATEADD(day, (ABS(CHECKSUM(NEWID())) % 365) - 182, DateOfBirth)
 ;
 
-PRINT 'Row count after: ' + CAST((SELECT COUNT(*) FROM [dbo].[Applicants]) AS VARCHAR);
+SET @rc = (SELECT COUNT(*) FROM [dbo].[Applicants]);
+PRINT 'Row count after: ' + CAST(@rc AS VARCHAR);
 PRINT '[dbo].[Applicants] complete.';
 
 -- Uncomment ROLLBACK and comment COMMIT to test without persisting changes
