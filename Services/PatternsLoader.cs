@@ -57,6 +57,17 @@ public static class PatternsLoader
 
             ValidateActionFields(p.Action, p.Value, p.Expression, $"fuzzy pattern '{p.Pattern}'");
         }
+
+        for (int i = 0; i < file.Ignore.Count; i++)
+        {
+            // An ignore entry must specify a column, a table, or both. A bare
+            // table entry ignores every column in that table.
+            if (string.IsNullOrWhiteSpace(file.Ignore[i].Column) &&
+                string.IsNullOrWhiteSpace(file.Ignore[i].Table))
+            {
+                throw new InvalidOperationException($"Ignore pattern at index {i} must specify a 'column', a 'table', or both.");
+            }
+        }
     }
 
     private static void ValidateActionFields(ColumnAction action, string? value, string? expression, string context)

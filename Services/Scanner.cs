@@ -57,43 +57,42 @@ public static class Scanner
         ["birth_date"]    = (ColumnAction.Calculate, null, null, "dob"),
     };
 
-    // Internal unified fuzzy pattern record
-    private readonly record struct FuzzyMatch(string Pattern, ColumnAction Action, string? Value, string? Expression);
+    // Internal unified fuzzy pattern record. Table is null for built-ins (global);
+    // a user pattern may set it to scope the match to a single table.
+    private readonly record struct FuzzyMatch(string Pattern, ColumnAction Action, string? Value, string? Expression, string? Table);
 
     // Fuzzy patterns: if a column name contains any of these substrings, flag for review
     private static readonly FuzzyMatch[] BuiltInFuzzyPatterns =
     {
-        new("name",    ColumnAction.Shuffle,  null,            null),
-        new("email",   ColumnAction.Replace,  null,            null),   // value resolved at runtime using PK
-        new("phone",   ColumnAction.Replace,  "'555-000-0000'", null),
-        new("mobile",  ColumnAction.Replace,  "'555-000-0000'", null),
-        new("addr",    ColumnAction.Replace,  "NULL",          null),
-        new("street",  ColumnAction.Replace,  "NULL",          null),
-        new("ssn",     ColumnAction.Replace,  "NULL",          null),
-        new("birth",   ColumnAction.Calculate, null,           null),   // expression resolved at runtime
-        new("salary",  ColumnAction.Replace,  "NULL",          null),
-        new("wage",    ColumnAction.Replace,  "NULL",          null),
-        new("bank",    ColumnAction.Replace,  "NULL",          null),
-        new("account", ColumnAction.Replace,  "NULL",          null),
+        new("name",    ColumnAction.Shuffle,  null,            null, null),
+        new("email",   ColumnAction.Replace,  null,            null, null),   // value resolved at runtime using PK
+        new("phone",   ColumnAction.Replace,  "'555-000-0000'", null, null),
+        new("mobile",  ColumnAction.Replace,  "'555-000-0000'", null, null),
+        new("addr",    ColumnAction.Replace,  "NULL",          null, null),
+        new("street",  ColumnAction.Replace,  "NULL",          null, null),
+        new("ssn",     ColumnAction.Replace,  "NULL",          null, null),
+        new("birth",   ColumnAction.Calculate, null,           null, null),   // expression resolved at runtime
+        new("salary",  ColumnAction.Replace,  "NULL",          null, null),
+        new("wage",    ColumnAction.Replace,  "NULL",          null, null),
+        new("bank",    ColumnAction.Replace,  "NULL",          null, null),
+        new("account", ColumnAction.Replace,  "NULL",          null, null),
     };
 
     public static async Task<MaskingConfig> ScanAsync(string connectionString, PatternsFile? extraPatterns = null)
     {
-        // Merge extra exact patterns — user-supplied entries override built-ins on name collision
-        var effectiveExact = new Dictionary<string, (ColumnAction action, string? value, string? expression, string category)>(ExactMatches, StringComparer.OrdinalIgnoreCase);
-        if (extraPatterns?.Exact.Count > 0)
-        {
-            foreach (var p in extraPatterns.Exact)
-                effectiveExact[p.Column] = (p.Action, p.Value, p.Expression, "custom");
-        }
+        // User exact patterns are resolved per column (table-scoped beats global, and
+        // both override built-ins) — the raw list is passed through to ClassifyColumn.
+        IReadOnlyList<ExactPattern> userExact = extraPatterns?.Exact ?? (IReadOnlyList<ExactPattern>)Array.Empty<ExactPattern>();
 
         // Extra fuzzy patterns are checked before built-ins so they can take precedence
         FuzzyMatch[] effectiveFuzzy = extraPatterns?.Fuzzy.Count > 0
             ? extraPatterns.Fuzzy
-                .Select(p => new FuzzyMatch(p.Pattern, p.Action, p.Value, p.Expression))
+                .Select(p => new FuzzyMatch(p.Pattern, p.Action, p.Value, p.Expression, p.Table))
                 .Concat(BuiltInFuzzyPatterns)
                 .ToArray()
             : BuiltInFuzzyPatterns;
+
+        IReadOnlyList<IgnorePattern> ignorePatterns = extraPatterns?.Ignore ?? (IReadOnlyList<IgnorePattern>)Array.Empty<IgnorePattern>();
 
         var config = new MaskingConfig();
 
@@ -119,6 +118,10 @@ public static class Scanner
 
         foreach (var (schema, tableName) in tables)
         {
+            // A bare-table ignore entry skips the table entirely — no column query needed
+            if (IsTableFullyIgnored(tableName, ignorePatterns))
+                continue;
+
             // Get PK column name for email replacement pattern
             string pkColumn = await GetPrimaryKeyAsync(connection, schema, tableName) ?? $"{tableName}Id";
 
@@ -139,7 +142,11 @@ public static class Scanner
                 string colName = colReader.GetString(0);
                 string dataType = colReader.GetString(1);
 
-                var colConfig = ClassifyColumn(colName, dataType, pkColumn, effectiveExact, effectiveFuzzy);
+                // Ignore list is checked first — it suppresses built-in and user patterns alike
+                if (IsIgnored(colName, tableName, ignorePatterns))
+                    continue;
+
+                var colConfig = ClassifyColumn(colName, dataType, tableName, pkColumn, userExact, effectiveFuzzy);
                 if (colConfig != null)
                 {
                     tableConfig.Columns.Add(colConfig);
@@ -158,12 +165,27 @@ public static class Scanner
     private static ColumnConfig? ClassifyColumn(
         string colName,
         string dataType,
+        string tableName,
         string pkColumn,
-        Dictionary<string, (ColumnAction action, string? value, string? expression, string category)> exactMatches,
+        IReadOnlyList<ExactPattern> userExact,
         FuzzyMatch[] fuzzyPatterns)
     {
-        // Check exact matches first
-        if (exactMatches.TryGetValue(colName, out var match))
+        // User exact patterns take precedence over built-ins; a table-scoped entry
+        // wins over a global (table-less) one for the same column name.
+        ExactPattern? userMatch = ResolveExactPattern(colName, tableName, userExact);
+        if (userMatch != null)
+        {
+            return new ColumnConfig
+            {
+                Name = colName,
+                Action = userMatch.Action,
+                Value = userMatch.Value,
+                Expression = userMatch.Expression
+            };
+        }
+
+        // Built-in exact matches
+        if (ExactMatches.TryGetValue(colName, out var match))
         {
             var col = new ColumnConfig
             {
@@ -193,6 +215,11 @@ public static class Scanner
         string normalizedName = colName.ToLowerInvariant();
         foreach (var fuzzy in fuzzyPatterns)
         {
+            // A table-scoped fuzzy pattern applies only to its own table
+            if (!string.IsNullOrWhiteSpace(fuzzy.Table) &&
+                !string.Equals(fuzzy.Table, tableName, StringComparison.OrdinalIgnoreCase))
+                continue;
+
             if (!normalizedName.Contains(fuzzy.Pattern, StringComparison.OrdinalIgnoreCase))
                 continue;
 
@@ -234,6 +261,77 @@ public static class Scanner
         }
 
         return null;
+    }
+
+    /// <summary>
+    /// Finds the user-defined exact pattern that applies to a column. A pattern whose
+    /// table matches the column's table wins over a table-less (global) one; returns
+    /// null when no user pattern matches. Comparisons are case-insensitive.
+    /// </summary>
+    private static ExactPattern? ResolveExactPattern(string colName, string tableName, IReadOnlyList<ExactPattern> userExact)
+    {
+        ExactPattern? globalMatch = null;
+
+        foreach (var pattern in userExact)
+        {
+            if (!string.Equals(pattern.Column, colName, StringComparison.OrdinalIgnoreCase))
+                continue;
+
+            if (string.IsNullOrWhiteSpace(pattern.Table))
+                globalMatch ??= pattern;
+            else if (string.Equals(pattern.Table, tableName, StringComparison.OrdinalIgnoreCase))
+                return pattern; // table-scoped match — highest precedence
+        }
+
+        return globalMatch;
+    }
+
+    /// <summary>
+    /// Returns true when the column should be excluded from scanning. An ignore
+    /// entry can specify a column, a table, or both:
+    ///   column only -> ignored in every table.
+    ///   table only  -> every column of that table is ignored.
+    ///   both        -> only the named column in the named table is ignored.
+    /// Both comparisons are case-insensitive.
+    /// </summary>
+    private static bool IsIgnored(string colName, string tableName, IReadOnlyList<IgnorePattern> ignores)
+    {
+        foreach (var ignore in ignores)
+        {
+            bool columnMatches = string.IsNullOrWhiteSpace(ignore.Column) ||
+                                 string.Equals(ignore.Column, colName, StringComparison.OrdinalIgnoreCase);
+            if (!columnMatches)
+                continue;
+
+            bool tableMatches = string.IsNullOrWhiteSpace(ignore.Table) ||
+                                string.Equals(ignore.Table, tableName, StringComparison.OrdinalIgnoreCase);
+            if (!tableMatches)
+                continue;
+
+            return true;
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// True when an ignore entry names this table with no column, meaning every
+    /// column of the table should be skipped. Used to short-circuit the column
+    /// query when the whole table is ignored.
+    /// </summary>
+    private static bool IsTableFullyIgnored(string tableName, IReadOnlyList<IgnorePattern> ignores)
+    {
+        foreach (var ignore in ignores)
+        {
+            if (string.IsNullOrWhiteSpace(ignore.Column) &&
+                !string.IsNullOrWhiteSpace(ignore.Table) &&
+                string.Equals(ignore.Table, tableName, StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     private static async Task<string?> GetPrimaryKeyAsync(SqlConnection connection, string schema, string tableName)

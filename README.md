@@ -50,6 +50,12 @@ pii-masker --scan --connection "..." --patterns my-patterns.json --output sugges
       "column": "AnnualSalary",
       "action": "calculate",
       "expression": "ROUND([AnnualSalary] / 5000.0, 0) * 5000"
+    },
+    {
+      "column": "Username",
+      "table": "ApiCredentials",
+      "action": "replace",
+      "value": "''"
     }
   ],
   "fuzzy": [
@@ -63,6 +69,18 @@ pii-masker --scan --connection "..." --patterns my-patterns.json --output sugges
       "action": "replace",
       "value": "NULL"
     }
+  ],
+  "ignore": [
+    {
+      "column": "Name"
+    },
+    {
+      "column": "AccountManager",
+      "table": "Vendors"
+    },
+    {
+      "table": "AuditLog"
+    }
   ]
 }
 ```
@@ -71,7 +89,26 @@ pii-masker --scan --connection "..." --patterns my-patterns.json --output sugges
 
 **`fuzzy`** — matches any column whose name *contains* the pattern as a substring (case-insensitive). User-defined fuzzy patterns are checked before the built-in ones, so they can take precedence. Matched columns are always flagged with `"review": true` in the output.
 
-Both entry types follow the same `action` / `value` / `expression` rules as the masking config.
+**`ignore`** — excludes a column (or whole table) from scanning entirely. Ignored columns are matched by no pattern — built-in or user-defined — so they never appear in the output. The ignore list is evaluated first, so it overrides everything else. Each entry must specify at least one of `column` or `table`:
+
+- `column` only — ignored in every table.
+- `table` only — every column of that table is ignored (the table is skipped entirely; useful for system/junction tables that hold no personal data).
+- both — only that column in that table is ignored.
+
+Use it to suppress false positives and keep scan output consistent across databases with similar schemas.
+
+#### Optional `table` scoping
+
+`exact`, `fuzzy`, and `ignore` entries all accept an optional `table` field:
+
+- **omitted (or empty)** — the entry applies to any column with that name, in every table.
+- **set** — the entry applies only to the named table (case-insensitive).
+
+For `exact` and `fuzzy`, a table-scoped entry takes precedence over a table-less one for the same column, which lets you set a different action/value for one specific table — e.g. a generic rule for `Username` everywhere, plus a `table`-scoped override for `ApiCredentials.Username`.
+
+For `ignore`, the `column` field is also optional — an entry with only `table` set ignores every column in that table.
+
+The `exact` and `fuzzy` entry types follow the same `action` / `value` / `expression` rules as the masking config. `ignore` entries take no action.
 
 ## Config file format
 

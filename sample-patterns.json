@@ -13,6 +13,12 @@
       "column": "AnnualSalary",
       "action": "calculate",
       "expression": "ROUND([AnnualSalary] / 5000.0, 0) * 5000"
+    },
+    {
+      "column": "Reference",
+      "table": "Applicants",
+      "action": "replace",
+      "value": "NULL"
     }
   ],
   "fuzzy": [
@@ -29,6 +35,15 @@
     {
       "pattern": "nickname",
       "action": "shuffle"
+    }
+  ],
+  "ignore": [
+    {
+      "column": "DisplayName",
+      "table": "ProductCatalog"
+    },
+    {
+      "column": "CompanyName"
     }
   ]
 }
