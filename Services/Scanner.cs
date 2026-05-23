@@ -197,7 +197,7 @@ public static class Scanner
             switch (match.category)
             {
                 case "email":
-                    col.Value = $"CONCAT('user_', CAST([{pkColumn}] AS VARCHAR), '@dev.invalid')";
+                    col.Value = $"CONCAT('user_', CAST([{pkColumn}] AS VARCHAR(50)), '@dev.invalid')";
                     break;
                 case "dob":
                     col.Expression = $"DATEADD(day, (ABS(CHECKSUM(NEWID())) % 365) - 182, [{colName}])";
@@ -241,7 +241,7 @@ public static class Scanner
                 switch (fuzzy.Pattern)
                 {
                     case "email":
-                        col.Value = $"CONCAT('user_', CAST([{pkColumn}] AS VARCHAR), '@dev.invalid')";
+                        col.Value = $"CONCAT('user_', CAST([{pkColumn}] AS VARCHAR(50)), '@dev.invalid')";
                         break;
                     case "birth":
                         col.Expression = $"DATEADD(day, (ABS(CHECKSUM(NEWID())) % 365) - 182, [{colName}])";

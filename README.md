@@ -130,7 +130,7 @@ The `exact` and `fuzzy` entry types follow the same `action` / `value` / `expres
         {
           "name": "Email",
           "action": "replace",
-          "value": "CONCAT('user_', CAST(ApplicantId AS VARCHAR), '@dev.invalid')"
+          "value": "CONCAT('user_', CAST(ApplicantId AS VARCHAR(50)), '@dev.invalid')"
         },
         {
           "name": "Phone",
@@ -207,7 +207,7 @@ JOIN Shuffled s ON o.rn = s.rn;
 -- Replace columns
 UPDATE [dbo].[Applicants]
 SET
-  [Email] = CONCAT('user_', CAST(ApplicantId AS VARCHAR), '@dev.invalid'),
+  [Email] = CONCAT('user_', CAST(ApplicantId AS VARCHAR(50)), '@dev.invalid'),
   [Phone] = '555-000-0000',
   [StreetAddress] = NULL
 ;
