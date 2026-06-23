@@ -69,7 +69,7 @@ public static class ScriptGenerator
             }
 
             var meta = GetTableMeta(connection, table);
-            totalColumns += GenerateTable(sb, table, meta, batchSize, rebuildIndexes);
+            totalColumns += GenerateTable(sb, table, meta, batchSize, rebuildIndexes, tableCount);
             tableCount++;
         }
 
@@ -79,10 +79,17 @@ public static class ScriptGenerator
     }
 
     private static int GenerateTable(
-        StringBuilder sb, TableConfig table, TableMeta meta, int batchSize, bool rebuildIndexes)
+        StringBuilder sb, TableConfig table, TableMeta meta, int batchSize, bool rebuildIndexes, int tableIndex)
     {
         string fullName = $"[{table.Schema}].[{table.Name}]";
         string pk = meta.PkColumn;
+
+        // Each table gets its own temp-table names. The whole script is a single
+        // batch (no GO), and SQL Server fails at compile time if the same temp
+        // table is created via SELECT...INTO more than once in one batch — even
+        // with a DROP TABLE IF EXISTS between the two creations.
+        string valsTbl = $"#vals{tableIndex}";
+        string origTbl = $"#orig{tableIndex}";
 
         var shuffleColumns = table.Columns.Where(c => c.Action == ColumnAction.Shuffle).ToList();
 
@@ -116,7 +123,7 @@ public static class ScriptGenerator
             GenerateDisableIndexes(sb, fullName);
 
         if (hasShuffle)
-            GenerateShuffleTempTables(sb, fullName, pk, shuffleColumns);
+            GenerateShuffleTempTables(sb, fullName, pk, shuffleColumns, valsTbl, origTbl);
 
         if (useLoop)
         {
@@ -124,7 +131,7 @@ public static class ScriptGenerator
             sb.AppendLine("WHILE @lo IS NOT NULL AND @lo <= @hi");
             sb.AppendLine("BEGIN");
             if (hasShuffle)
-                AppendShuffleUpdate(sb, fullName, pk, shuffleColumns, batched: true, indent: "  ");
+                AppendShuffleUpdate(sb, fullName, pk, shuffleColumns, valsTbl, origTbl, batched: true, indent: "  ");
             if (hasDirect)
                 AppendDirectUpdate(sb, fullName, pk, directColumns, batched: true, indent: "  ");
             sb.AppendLine("  SET @lo = @lo + @bs;");
@@ -135,14 +142,14 @@ public static class ScriptGenerator
         else
         {
             if (hasShuffle)
-                AppendShuffleUpdate(sb, fullName, pk, shuffleColumns, batched: false, indent: "");
+                AppendShuffleUpdate(sb, fullName, pk, shuffleColumns, valsTbl, origTbl, batched: false, indent: "");
             if (hasDirect)
                 AppendDirectUpdate(sb, fullName, pk, directColumns, batched: false, indent: "");
         }
 
         if (hasShuffle)
         {
-            sb.AppendLine("DROP TABLE IF EXISTS #vals, #orig;");
+            sb.AppendLine($"DROP TABLE IF EXISTS {valsTbl}, {origTbl};");
             sb.AppendLine();
         }
 
@@ -163,7 +170,8 @@ public static class ScriptGenerator
     }
 
     private static void GenerateShuffleTempTables(
-        StringBuilder sb, string fullName, string pk, List<ColumnConfig> shuffleColumns)
+        StringBuilder sb, string fullName, string pk, List<ColumnConfig> shuffleColumns,
+        string valsTbl, string origTbl)
     {
         // A single pass captures a randomly-ordered copy of every shuffled column
         // (one ORDER BY NEWID() sort, regardless of how many columns are shuffled),
@@ -171,26 +179,26 @@ public static class ScriptGenerator
         // redistributes the values. The previous approach sorted the whole table
         // twice per column; this sorts it once per table.
         sb.AppendLine("-- Capture shuffled values + PK map (one pass for all shuffled columns)");
-        sb.AppendLine("DROP TABLE IF EXISTS #vals, #orig;");
+        sb.AppendLine($"DROP TABLE IF EXISTS {valsTbl}, {origTbl};");
         sb.AppendLine("SELECT");
         foreach (var col in shuffleColumns)
             sb.AppendLine($"  [{col.Name}],");
         sb.AppendLine("  ROW_NUMBER() OVER (ORDER BY NEWID()) AS rn");
-        sb.AppendLine($"INTO #vals FROM {fullName};");
+        sb.AppendLine($"INTO {valsTbl} FROM {fullName};");
         sb.AppendLine();
         sb.AppendLine("SELECT");
         sb.AppendLine($"  [{pk}],");
         sb.AppendLine("  ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS rn");
-        sb.AppendLine($"INTO #orig FROM {fullName};");
+        sb.AppendLine($"INTO {origTbl} FROM {fullName};");
         sb.AppendLine();
-        sb.AppendLine($"CREATE UNIQUE CLUSTERED INDEX IX_orig_pk ON #orig([{pk}]);");
-        sb.AppendLine("CREATE UNIQUE CLUSTERED INDEX IX_vals_rn ON #vals(rn);");
+        sb.AppendLine($"CREATE UNIQUE CLUSTERED INDEX IX_orig_pk ON {origTbl}([{pk}]);");
+        sb.AppendLine($"CREATE UNIQUE CLUSTERED INDEX IX_vals_rn ON {valsTbl}(rn);");
         sb.AppendLine();
     }
 
     private static void AppendShuffleUpdate(
         StringBuilder sb, string fullName, string pk, List<ColumnConfig> shuffleColumns,
-        bool batched, string indent)
+        string valsTbl, string origTbl, bool batched, string indent)
     {
         sb.AppendLine($"{indent}-- Apply shuffled values");
         sb.AppendLine($"{indent}UPDATE a");
@@ -201,8 +209,8 @@ public static class ScriptGenerator
             sb.AppendLine($"{indent}  a.[{shuffleColumns[i].Name}] = v.[{shuffleColumns[i].Name}]{comma}");
         }
         sb.AppendLine($"{indent}FROM {fullName} a");
-        sb.AppendLine($"{indent}JOIN #orig o ON a.[{pk}] = o.[{pk}]");
-        sb.Append($"{indent}JOIN #vals v ON o.rn = v.rn");
+        sb.AppendLine($"{indent}JOIN {origTbl} o ON a.[{pk}] = o.[{pk}]");
+        sb.Append($"{indent}JOIN {valsTbl} v ON o.rn = v.rn");
         if (batched)
         {
             sb.AppendLine();
