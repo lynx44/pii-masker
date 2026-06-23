@@ -22,17 +22,36 @@ var patternsOption = new Option<FileInfo?>(
     name: "--patterns",
     description: "Path to a JSON file with additional exact/fuzzy column name patterns for --scan mode");
 
+var batchSizeOption = new Option<int>(
+    name: "--batch-size",
+    description: "Rows per chunk for large tables with a single integer primary key. 0 disables chunking. Requires --connection.",
+    getDefaultValue: () => 50_000);
+
+var rebuildIndexesOption = new Option<bool>(
+    name: "--rebuild-indexes",
+    description: "Disable nonclustered indexes on large tables before masking and rebuild them afterwards. Requires --connection.");
+
 var rootCommand = new RootCommand("pii-masker — Generate T-SQL masking scripts from a config file")
 {
     configOption,
     connectionOption,
     outputOption,
     scanOption,
-    patternsOption
+    patternsOption,
+    batchSizeOption,
+    rebuildIndexesOption
 };
 
-rootCommand.SetHandler(async (FileInfo? config, string? connection, FileInfo? output, bool scan, FileInfo? patterns) =>
+rootCommand.SetHandler(async (context) =>
 {
+    var config = context.ParseResult.GetValueForOption(configOption);
+    var connection = context.ParseResult.GetValueForOption(connectionOption);
+    var output = context.ParseResult.GetValueForOption(outputOption);
+    var scan = context.ParseResult.GetValueForOption(scanOption);
+    var patterns = context.ParseResult.GetValueForOption(patternsOption);
+    var batchSize = context.ParseResult.GetValueForOption(batchSizeOption);
+    var rebuildIndexes = context.ParseResult.GetValueForOption(rebuildIndexesOption);
+
     try
     {
         if (scan)
@@ -41,7 +60,7 @@ rootCommand.SetHandler(async (FileInfo? config, string? connection, FileInfo? ou
         }
         else
         {
-            HandleGenerate(config, connection, output);
+            HandleGenerate(config, connection, output, batchSize, rebuildIndexes);
         }
     }
     catch (Exception ex)
@@ -49,7 +68,7 @@ rootCommand.SetHandler(async (FileInfo? config, string? connection, FileInfo? ou
         Console.Error.WriteLine($"Error: {ex.Message}");
         Environment.ExitCode = 1;
     }
-}, configOption, connectionOption, outputOption, scanOption, patternsOption);
+});
 
 return await rootCommand.InvokeAsync(args);
 
@@ -57,7 +76,7 @@ return await rootCommand.InvokeAsync(args);
 // Handlers
 // ──────────────────────────────────────────────────────────────────────
 
-static void HandleGenerate(FileInfo? configFile, string? connection, FileInfo? outputFile)
+static void HandleGenerate(FileInfo? configFile, string? connection, FileInfo? outputFile, int batchSize, bool rebuildIndexes)
 {
     if (configFile is null)
     {
@@ -77,7 +96,7 @@ static void HandleGenerate(FileInfo? configFile, string? connection, FileInfo? o
     var maskingConfig = ConfigLoader.Load(configFile.FullName);
 
     Console.WriteLine($"Generating masking script for {maskingConfig.Tables.Count} table(s)...");
-    var (sql, tableCount, columnCount) = ScriptGenerator.Generate(maskingConfig, connection ?? string.Empty);
+    var (sql, tableCount, columnCount) = ScriptGenerator.Generate(maskingConfig, connection ?? string.Empty, batchSize, rebuildIndexes);
 
     var outputDir = Path.GetDirectoryName(outputFile.FullName);
     if (!string.IsNullOrEmpty(outputDir))

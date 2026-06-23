@@ -10,10 +10,31 @@ A CLI tool that generates T-SQL masking scripts from a JSON config file. Designe
 pii-masker --config masking-config.json --output mask.sql
 ```
 
-If you provide a `--connection` string, the tool will query the database for primary key information to generate more accurate shuffle operations:
+If you provide a `--connection` string, the tool will query the database for primary key information to generate more accurate shuffle operations. It also enables the large-table optimizations described below (PK-range chunking and optional index rebuilding):
 
 ```bash
 pii-masker --config masking-config.json --connection "Server=.;Database=MyDb;Trusted_Connection=True;TrustServerCertificate=True" --output mask.sql
+```
+
+### Large databases / performance
+
+The generator is tuned for masking tables with millions of rows:
+
+- **One sort per table for shuffles.** All shuffled columns are captured in a single `ORDER BY NEWID()` pass into a temp table, rather than sorting the whole table twice *per column*. This is usually the single biggest speedup.
+- **No wrapping transaction.** Each statement autocommits so the transaction log can be truncated continuously instead of growing to hold every change at once. This is safe because masking is meant to run against backups / non-production copies — if a run fails partway, re-run it.
+- **PK-range chunking.** Large UPDATEs are split into primary-key ranges so locks and log usage stay bounded, with a `CHECKPOINT` after each batch.
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--batch-size <n>` | `50000` | Rows per chunk. Chunking is applied only to tables with a **single integer primary key** (detected via `--connection`). Set to `0` to disable chunking. |
+| `--rebuild-indexes` | off | Before masking a large table, disable its **nonclustered** indexes and rebuild them afterwards. The clustered index, primary key, and unique constraints are always left in place. |
+
+Both options require `--connection` (they need the database's primary-key types and row-count estimates). Without a connection, the tool still applies the consolidated-shuffle and no-wrapping-transaction optimizations, but skips chunking and index handling.
+
+```bash
+pii-masker --config masking-config.json \
+  --connection "Server=.;Database=MyDb;Trusted_Connection=True;TrustServerCertificate=True" \
+  --batch-size 100000 --rebuild-indexes --output mask.sql
 ```
 
 ### Scan a database for PII columns
@@ -157,77 +178,105 @@ The `exact` and `fuzzy` entry types follow the same `action` / `value` / `expres
 
 | Action      | Required field | Description |
 |-------------|---------------|-------------|
-| `shuffle`   | —             | Randomly redistributes existing values across rows using a set-based CTE approach |
+| `shuffle`   | —             | Randomly redistributes existing values across rows (set-based, one sort per table regardless of how many columns are shuffled) |
 | `replace`   | `value`       | Sets the column to a T-SQL expression (e.g. `NULL`, a string literal, or `CONCAT(...)`) |
 | `calculate` | `expression`  | Sets the column to a computed T-SQL expression referencing the current row |
 
 ## Sample generated output
 
+Generated with `--connection`, `--batch-size 25000`, and `--rebuild-indexes` against a large table with an integer primary key:
+
 ```sql
 /*
   PII Masking Script
-  Generated: 2026-03-27 05:52:02 UTC
+  Generated: 2026-06-23 00:41:40 UTC
   Tables: 1
+  Chunking: 25,000 rows/batch (tables with a single integer PK)
+  Index rebuild: enabled (large tables)
 */
 
 SET NOCOUNT ON;
-SET XACT_ABORT ON;
-
-BEGIN TRANSACTION;
 
 DECLARE @rc INT;
+DECLARE @lo BIGINT, @hi BIGINT;
+DECLARE @bs INT = 25000;
+DECLARE @disable NVARCHAR(MAX);
 
 -- ======================================================================
--- Table: [dbo].[Applicants]
+-- Table: [dbo].[Applicants]  (~120,000 rows)
 -- ======================================================================
 
 PRINT 'Processing [dbo].[Applicants]...';
 SET @rc = (SELECT COUNT(*) FROM [dbo].[Applicants]);
 PRINT 'Row count before: ' + CAST(@rc AS VARCHAR);
 
--- Shuffle: FirstName
-WITH Shuffled AS (
-  SELECT
-    ROW_NUMBER() OVER (ORDER BY NEWID()) AS rn,
-    [FirstName]
-  FROM [dbo].[Applicants]
-),
-Original AS (
-  SELECT
-    ROW_NUMBER() OVER (ORDER BY NEWID()) AS rn,
-    [ApplicantId]
-  FROM [dbo].[Applicants]
-)
-UPDATE a
-SET a.[FirstName] = s.[FirstName]
-FROM [dbo].[Applicants] a
-JOIN Original o ON a.[ApplicantId] = o.[ApplicantId]
-JOIN Shuffled s ON o.rn = s.rn;
+PRINT 'Disabling nonclustered indexes on [dbo].[Applicants]...';
+SET @disable = N'';
+SELECT @disable += N'ALTER INDEX ' + QUOTENAME(i.name) + N' ON [dbo].[Applicants] DISABLE;' + CHAR(13)
+FROM sys.indexes i
+WHERE i.object_id = OBJECT_ID('[dbo].[Applicants]')
+  AND i.type_desc = 'NONCLUSTERED'
+  AND i.is_primary_key = 0
+  AND i.is_unique_constraint = 0
+  AND i.name IS NOT NULL;
+IF @disable <> N'' EXEC sp_executesql @disable;
 
--- Replace columns
-UPDATE [dbo].[Applicants]
-SET
-  [Email] = CONCAT('user_', CAST(ApplicantId AS VARCHAR(50)), '@dev.invalid'),
-  [Phone] = '555-000-0000',
-  [StreetAddress] = NULL
-;
+-- Capture shuffled values + PK map (one pass for all shuffled columns)
+DROP TABLE IF EXISTS #vals, #orig;
+SELECT
+  [FirstName],
+  [LastName],
+  ROW_NUMBER() OVER (ORDER BY NEWID()) AS rn
+INTO #vals FROM [dbo].[Applicants];
 
--- Calculate columns
-UPDATE [dbo].[Applicants]
-SET
-  [DateOfBirth] = DATEADD(day, (ABS(CHECKSUM(NEWID())) % 365) - 182, DateOfBirth)
-;
+SELECT
+  [ApplicantId],
+  ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS rn
+INTO #orig FROM [dbo].[Applicants];
+
+CREATE UNIQUE CLUSTERED INDEX IX_orig_pk ON #orig([ApplicantId]);
+CREATE UNIQUE CLUSTERED INDEX IX_vals_rn ON #vals(rn);
+
+SELECT @lo = MIN([ApplicantId]), @hi = MAX([ApplicantId]) FROM [dbo].[Applicants];
+WHILE @lo IS NOT NULL AND @lo <= @hi
+BEGIN
+  -- Apply shuffled values
+  UPDATE a
+  SET
+    a.[FirstName] = v.[FirstName],
+    a.[LastName] = v.[LastName]
+  FROM [dbo].[Applicants] a
+  JOIN #orig o ON a.[ApplicantId] = o.[ApplicantId]
+  JOIN #vals v ON o.rn = v.rn
+  WHERE a.[ApplicantId] >= @lo AND a.[ApplicantId] < @lo + @bs;
+
+  -- Replace / calculate columns
+  UPDATE [dbo].[Applicants]
+  SET
+    [Email] = CONCAT('user_', CAST(ApplicantId AS VARCHAR), '@dev.invalid'),
+    [Phone] = '555-000-0000',
+    [StreetAddress] = NULL,
+    [DateOfBirth] = DATEADD(day, (ABS(CHECKSUM(NEWID())) % 365) - 182, DateOfBirth)
+  WHERE [ApplicantId] >= @lo AND [ApplicantId] < @lo + @bs;
+
+  SET @lo = @lo + @bs;
+  CHECKPOINT;
+END
+
+DROP TABLE IF EXISTS #vals, #orig;
+
+PRINT 'Rebuilding indexes on [dbo].[Applicants]...';
+ALTER INDEX ALL ON [dbo].[Applicants] REBUILD;
 
 SET @rc = (SELECT COUNT(*) FROM [dbo].[Applicants]);
 PRINT 'Row count after: ' + CAST(@rc AS VARCHAR);
 PRINT '[dbo].[Applicants] complete.';
-
--- Uncomment ROLLBACK and comment COMMIT to test without persisting changes
--- ROLLBACK TRANSACTION;
-COMMIT TRANSACTION;
+PRINT '';
 
 PRINT 'Masking complete. 1 table(s), 6 column(s) processed.';
 ```
+
+Without a connection (or for a table without a single integer PK), the same masking is emitted without the `WHILE` chunk loop and index handling — the shuffle still uses the single-sort temp-table approach.
 
 ## Building
 
